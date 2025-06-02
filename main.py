@@ -8,6 +8,9 @@ import os
 from safetensors import safe_open
 from safetensors.torch import load_file as load_sft
 from huggingface_hub import hf_hub_download
+import torch.onnx
+import onnxruntime
+import numpy as np
 
 
 def load_flow_model_by_type(name: str, device: str | torch.device = "cuda", hf_download: bool = True, lora_path=None, model_type='src.flux.model.Flux'):
@@ -276,3 +279,109 @@ def set_lora(model, local_path: str = None, repo_id: str = None, name: str = Non
 def Load_model(lora_path: str="https://huggingface.co/bytedance-research/Dreamfit/resolve/main/flux_i2i.bin?download=true", model_path: str="https://huggingface.co/Shakker-Labs/AWPortrait-FL/resolve/main/AWPortrait-FL-fp8.safetensors?download=true"):
     model = load_flow_model_by_type("flux-dev", device="cpu", lora_path=lora_path, model_type=model_path)
     set_lora(model, lora_path, "", "", 1.0, 16, None, None)
+    print("Exporting model to ONNX...")
+    export_model_to_onnx(model, "flux_model.onnx")
+    print("Model exported to flux_model.onnx")
+    return model
+
+
+def export_model_to_onnx(model, onnx_filepath):
+    """Exports the given model to ONNX format.
+
+    Args:
+        model: The PyTorch model to export.
+        onnx_filepath: The path to save the ONNX model.
+    """
+    params = model.params
+
+    # Create dummy inputs
+    img_seq_len = params.axes_dim[1] * params.axes_dim[2]
+    img = torch.randn(1, img_seq_len, params.in_channels, dtype=torch.bfloat16)
+    img_ids = torch.zeros(1, img_seq_len, params.hidden_size // params.num_heads, dtype=torch.bfloat16)
+
+    txt_seq_len = 77  # Standard CLIP sequence length
+    txt = torch.randn(1, txt_seq_len, params.context_in_dim, dtype=torch.bfloat16)
+    txt_ids = torch.zeros(1, txt_seq_len, params.hidden_size // params.num_heads, dtype=torch.bfloat16)
+
+    timesteps = torch.randn(1, dtype=torch.bfloat16)
+    y = torch.randn(1, params.vec_in_dim, dtype=torch.bfloat16)
+
+    guidance = None
+    if params.guidance_embed:
+        guidance = torch.randn(1, dtype=torch.bfloat16)
+
+    dummy_inputs = (img, img_ids, txt, txt_ids, timesteps, y)
+    input_names = ["img", "img_ids", "txt", "txt_ids", "timesteps", "y"]
+
+    if guidance is not None:
+        dummy_inputs += (guidance,)
+        input_names.append("guidance")
+
+    output_names = ["output"]  # Replace with actual output names if known
+
+    torch.onnx.export(
+        model,
+        dummy_inputs,
+        onnx_filepath,
+        input_names=input_names,
+        output_names=output_names,
+        opset_version=17,
+        do_constant_folding=True,
+        # example_outputs=model(*dummy_inputs) # Optional: for output shape inference
+    )
+    print(f"Model exported to {onnx_filepath}")
+
+
+def verify_onnx_model(onnx_filepath, params):
+    """Verifies the ONNX model by running inference with dummy inputs.
+
+    Args:
+        onnx_filepath: Path to the ONNX model file.
+        params: Model parameters from the original PyTorch model.
+    """
+    try:
+        print("Verifying ONNX model...")
+
+        # Create dummy inputs as NumPy arrays (float32)
+        img_seq_len = params.axes_dim[1] * params.axes_dim[2]
+        img = np.random.randn(1, img_seq_len, params.in_channels).astype(np.float32)
+        img_ids = np.zeros((1, img_seq_len, params.hidden_size // params.num_heads), dtype=np.float32)
+
+        txt_seq_len = 77  # Standard CLIP sequence length
+        txt = np.random.randn(1, txt_seq_len, params.context_in_dim).astype(np.float32)
+        txt_ids = np.zeros((1, txt_seq_len, params.hidden_size // params.num_heads), dtype=np.float32)
+
+        timesteps = np.random.randn(1).astype(np.float32)
+        y = np.random.randn(1, params.vec_in_dim).astype(np.float32)
+
+        ort_inputs = {
+            "img": img,
+            "img_ids": img_ids,
+            "txt": txt,
+            "txt_ids": txt_ids,
+            "timesteps": timesteps,
+            "y": y,
+        }
+
+        if params.guidance_embed:
+            guidance = np.random.randn(1).astype(np.float32)
+            ort_inputs["guidance"] = guidance
+
+        # Create ONNX runtime session
+        ort_session = onnxruntime.InferenceSession(onnx_filepath)
+        print(f"ONNX session created for {onnx_filepath}")
+
+        # Run inference
+        ort_outputs = ort_session.run(None, ort_inputs)
+
+        print("ONNX model verification successful.")
+        print(f"Output shape: {ort_outputs[0].shape}")
+
+    except Exception as e:
+        print(f"Error during ONNX model verification: {e}")
+        print("Please check for potential dtype mismatches (e.g., bfloat16 vs float32) or model export issues.")
+
+if __name__ == "__main__":
+    model = Load_model()
+    if model: # If model loaded successfully
+        verify_onnx_model("flux_model.onnx", model.params)
